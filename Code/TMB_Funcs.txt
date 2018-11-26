@@ -1,0 +1,140 @@
+### Functions for Calculating global TMB from whole exome mutation data
+
+abridge <- function(maf_file, nonsilent = TRUE) {
+# Takes a maf file and selects the characteristics required to perform TMB analysis
+# and removes duplicate entries (which exist for a variety of reasons, consult
+# the TCGA website)
+# Requires tidyverse
+    
+    data_abridged <- maf_file %>% 
+       select('Hugo_Symbol', Chromosome, one_of(c('Start_Position','Start_position')), one_of(c('End_Position','End_position')), Strand, Variant_Classification, Variant_Type, Reference_Allele, Tumor_Seq_Allele1, Tumor_Seq_Allele2, Tumor_Sample_Barcode,  Score) %>% 
+        distinct()
+
+    if (nonsilent == TRUE) {
+        data_abridged <- data_abridged %>% 
+            filter(Variant_Classification %in% c('Frame_Shift_Del', 'Frame_Shift_Ins', 'In_Frame_Del', 'In_Frame_Ins', 'Missense_Mutation', 'Nonsense_Mutation', 'Nonstop_Mutation', 'Splice_Site', 'Translation_Start_Site'))
+              }
+    return(data_abridged)
+}
+
+TMB_Calc <- function(maf_file, nonsilent = TRUE) {
+# Takes a maf file and outputs a table with tumor sample barcode and TMB value
+# Requires tidyverse to be installed
+# Depends on previous function 'abridge()'
+    
+    tmb_table <-  maf_file %>%  
+                abridge(nonsilent = nonsilent) %>% 
+                group_by(Tumor_Sample_Barcode) %>% 
+                summarise(TMB = n()/30)
+    
+    return(tmb_table)
+}
+
+
+### Functions for calculating association local vs global for a given window 
+
+Local_TMB_Calc <- function(maf_file, Chrom, Start, Window_Size, ns = FALSE, pre_abridged = FALSE) {
+# takes a maf file and outputs a table with tumor sample barcode and local TMB 
+# value for the window specified via chromosome, start position and window size
+# requires tidyverse to be installed
+# requires function 'abridge()'
+    
+    all_samples <- tibble(Tumor_Sample_Barcode = unique(maf_file$Tumor_Sample_Barcode))
+    
+    if (pre_abridged == FALSE) {
+        maf_file <- abridge(maf_file, nonsilent = ns)
+    }
+    
+    local_tmb_table  <- maf_file %>% 
+        filter(Chromosome == Chrom) %>% 
+        filter(Start_Position %in% (Start + 0:(Window_Size-1))) %>% 
+        group_by(Tumor_Sample_Barcode) %>% 
+        summarise(Local_TMB = n())
+    
+    local_tmb_table <- full_join(all_samples, local_tmb_table, by = "Tumor_Sample_Barcode")
+    local_tmb_table[is.na(local_tmb_table)] <- 0
+    
+    return(local_tmb_table)
+}
+
+getSignificance <- function(local_tmb_table, global_tmb_table) {
+# Takes a local tmb table and a global tmb table and returns the significance of their correlation
+# Not currently set up to account for multiple testing
+# Requires tidyverse
+    
+    comparison_table <- inner_join(local_tmb_table, global_tmb_table,
+           by = "Tumor_Sample_Barcode") 
+    #creates a table with Tumor sample barcode, global burden and local burden
+    
+    if (sum(comparison_table$Local_TMB != 0) > 0) {
+    return(-log(summary(lm(TMB~Local_TMB, comparison_table))$coefficients[2,4]))
+        }
+    else {
+        return(0)
+    }
+}
+    
+
+### Functions for a first pass window algorithm
+
+chromosome_slide <- function(maf_file, global_tmb_table = NULL, Chromosome, window_size, jump_length, ns = FALSE) {
+# performs a sliding window algorithm on one chromosome
+# outputs a vector of significances
+# can be given a global tmb table, otherwise will calculate itself
+# requires a genome to be loaded under name 'genome', ideally GChr37
+# requires packages tidyverse, BSGenome and functions abridge, TMB_Calc, Local_TMB_Calc and getSignificance 
+    
+# NOTE there's a weird thing going on at the moment where "global_tmb_table = NULL" must be explicitly fed 
+# to the function, else it doesn't work
+    
+    chromosomes <- c(1:22, "X", "Y")
+    maf_file <- abridge(maf_file, nonsilent = ns)
+    
+    
+    if (is.null(global_tmb_table)) {
+        global_tmb_table <- TMB_Calc(maf_file, nonsilent = TRUE)
+    }
+    
+    significance_vector <- c()
+    position_vector <- c()
+    chromosome_length <- length(genome[[which(chromosomes == Chromosome)]])
+    
+    
+    for (position in seq(from = 1, to = chromosome_length - window_size, by = jump_length)) { 
+        
+        local_tmb_table <- Local_TMB_Calc(maf_file, Chrom = Chromosome, Start = position, Window_Size = window_size, pre_abridged = TRUE)
+        significance_vector <- c(significance_vector, getSignificance(local_tmb_table, global_tmb_table))
+        position_vector <- c(position_vector, position)
+        
+    
+    } 
+    
+    len <- length(significance_vector)
+    chromosome_vector <- rep(Chromosome, len)
+    key_vector <- (1:len)/len
+    
+    return(tibble(chromosome = chromosome_vector, position = position_vector, key = key_vector, significance = significance_vector))
+    
+}
+
+
+genome_slide <- function(maf_file, global_tmb_table = NULL, window_size, jump_length, ns = FALSE) {
+   
+    maf_file <- abridge(maf_file, nonsilent = ns)
+    chromosomes <- c(1:22,"X","Y")
+    
+    if (is.null(global_tmb_table)) {
+        global_tmb_table = TMB_Calc(maf_file, nonsilent = TRUE)
+    }
+    
+    genome_association <- tibble(chromosome = character(), position = vector(), key = vector(), significance = vector())
+    
+    
+    for (n in 1:24) {
+        print(chromosomes[n])
+        genome_association <- bind_rows(genome_association, chromosome_slide(maf_file, global_tmb_table, chromosomes[n], window_size, jump_length))   
+    }
+    
+    return(genome_association)
+    
+}
