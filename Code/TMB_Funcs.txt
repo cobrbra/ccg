@@ -138,3 +138,74 @@ genome_slide <- function(maf_file, global_tmb_table = NULL, window_size, jump_le
     return(genome_association)
     
 }
+
+chromosome_restricted_slide <- function(maf_file, previous_run, zoom = 10, global_tmb_table = NULL, Chromosome, ns = FALSE, coverage = 10) {
+
+    
+maf_file <- abridge(maf_file, nonsilent = ns)
+    
+    old_jump_length <- as.numeric(previous_run[2,"position"] - previous_run[1,"position"])
+    
+    new_jump_length <- max(1,floor(old_jump_length/zoom))
+    new_window_size <- coverage*new_jump_length
+    
+    quant <- 1 - 1/zoom
+    
+    significant_positions <- previous_run %>% 
+        filter(significance > quantile(significance, quant)) %>% 
+        filter(chromosome == Chromosome)  
+        
+    
+    chromosome_positions <- c()
+    for (position in significant_positions$position) {
+        chromosome_positions <- c(chromosome_positions, seq(from = position, to = position + old_jump_length - new_jump_length, by = new_jump_length))
+    }
+    
+    if (is.null(global_tmb_table)) {
+        global_tmb_table <- TMB_Calc(maf_file, nonsilent = TRUE)
+    }
+    
+    significance_vector <- c()
+    position_vector <- c()
+    chromosome_length <- length(genome[[which(chromosomes == Chromosome)]])
+    
+    
+    for (position in chromosome_positions) { 
+        local_tmb_table <- Local_TMB_Calc(maf_file, Chrom = Chromosome, Start = position, Window_Size = new_window_size, pre_abridged = TRUE)
+        significance_vector <- c(significance_vector, getSignificance(local_tmb_table, global_tmb_table))
+    } 
+    
+    len <- length(significance_vector)
+    chromosome_vector <- rep(Chromosome, len)
+    key_vector <- (1:len)/len
+    
+    if (len > 0) {
+        return(tibble(chromosome = chromosome_vector, position = chromosome_positions, key = key_vector, significance = significance_vector))
+    }
+    else {
+        return(tibble(chromosome = character(), position = vector(), key = vector(), significance = vector()))
+    }
+    
+}
+
+genome_restricted_slide <- function(maf_file, previous_run, zoom = 10, global_tmb_table = NULL, ns = FALSE, coverage = 10) {
+   
+    maf_file <- abridge(maf_file, nonsilent = ns)
+    chromosomes <- c(1:22,"X","Y")
+    
+    if (is.null(global_tmb_table)) {
+        global_tmb_table = TMB_Calc(maf_file, nonsilent = TRUE)
+    }
+    
+    genome_association <- tibble(chromosome = character(), position = vector(), key = vector(), significance = vector())
+    
+    
+    for (n in 1:24) {
+        print(chromosomes[n])
+        genome_association <- bind_rows(genome_association, chromosome_restricted_slide(maf_file, previous_run, zoom = 10, global_tmb_table = NULL, Chromosome = chromosomes[n], ns = FALSE, coverage = 10))   
+       
+    }
+    
+    return(genome_association)
+    
+}
