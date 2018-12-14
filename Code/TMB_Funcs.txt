@@ -184,7 +184,7 @@ maf_file <- abridge(maf_file, nonsilent = ns)
     }
     else {
         return(tibble(chromosome = character(), position = vector(), key = vector(), significance = vector()))
-    }
+    } 
     
 }
 
@@ -208,4 +208,71 @@ genome_restricted_slide <- function(maf_file, previous_run, zoom = 10, global_tm
     
     return(genome_association)
     
+}
+
+### Functions for producing a training matrix
+
+getWindows <- function(window_run, panel_size, window_size) {
+    
+    working_panel <- tibble(chromosome = factor(character(), levels = c(1:22, "X", "Y")), position = vector())
+    jump_length <- (window_run[2,"position"] - window_run[1, "position"])[1,1]
+   
+    coverage <- as.integer(window_size/jump_length)
+    adding <- TRUE
+    
+    while (adding) {
+        new_position <- window_run %>% 
+            filter(significance == max(significance)) %>% 
+            filter(chromosome == min(chromosome)) %>% 
+            filter(position == min(position)) %>% 
+            select(chromosome, position)
+        
+        if (nrow(working_panel %>% 
+            add_row(chromosome = rep(new_position$chromosome[1], coverage), position = new_position$position[1] + jump_length*(0:(coverage-1))) %>% 
+            distinct())*jump_length <= panel_size) {
+            
+            working_panel <- working_panel %>% 
+                add_row(chromosome = rep(new_position$chromosome[1], coverage), position = new_position$position[1] + jump_length*(0:(coverage-1))) %>% 
+                distinct() %>% 
+                group_by(chromosome) %>% 
+                arrange(position, .by_group = TRUE) %>% 
+                ungroup()
+            
+        
+            window_run <- window_run %>% 
+                filter((chromosome != new_position$chromosome)|(position != new_position$position))
+        }
+        else {
+            adding <- FALSE
+        }
+    }
+    
+    return(working_panel)
+}
+
+getMatrix <- function(maf_file, candidate_panel, jump_length, global_tmb_tabe = NULL) {
+    
+    maf_file <- abridge(maf_file, nonsilent = FALSE)
+    
+    if (is.null(global_tmb_table)) {
+        global_tmb_table = TMB_Calc(maf_file, nonsilent = TRUE)
+    }
+    
+    window_matrix <- global_tmb_table
+    
+    for (n in 1:nrow(candidate_panel)) {
+        
+        new_column <- maf_file %>% 
+            filter(Chromosome == candidate_panel$chromosome[n], 
+                   Start_Position %in% (candidate_panel$position[n] + 0:(jump_length - 1))) %>%
+            group_by(Tumor_Sample_Barcode) %>% 
+            summarise(Window = n())
+    
+        colnames(new_column) <- c("Tumor_Sample_Barcode", paste("Window", n))
+        window_matrix <- full_join(window_matrix, new_column, by = "Tumor_Sample_Barcode")
+        
+    }
+    
+    window_matrix[is.na(window_matrix)]  <- 0
+    return(window_matrix)
 }
