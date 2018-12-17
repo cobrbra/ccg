@@ -208,16 +208,52 @@ genome_restricted_slide <- function(maf_file, previous_run, zoom = 10, global_tm
     
     return(genome_association)
     
+    
+RLL_slide <- function(maf_file, starting_window, iterations, zoom, coverage) {
+# Compiles a dataframe with iterations in one column and the dataframes giving the
+# results of that result of iteration in another
+    
+    global_tmb_table <- TMB_Calc(maf_file, nonsilent = TRUE)
+    
+    window_size <- starting_window
+    jump_length <- as.integer(window_size/coverage)
+    
+    full_positions <- genome_slide(maf_file, global_tmb_table, window_size, jump_length)
+    
+    full_positions$iteration <- rep(1, nrow(full_positions))
+    old_positions <- full_positions
+    
+    for (index in 2:iterations) {
+        window_size <- as.integer(window_size/zoom)
+        jump_length <- as.integer(jump_length/zoom)
+        
+        new_positions <- genome_restricted_slide(maf_file, old_positions, zoom, global_tmb_table, coverage)
+        new_positions$iteration <- rep(index, nrow(new_positions))
+        
+        full_positions <- bind_rows(full_positions, new_positions)
+        old_positions <- new_positions
+    }
+    
+    full_positions <- full_positions %>% 
+        group_by(iteration) %>% 
+        nest()    
+    
+    full_positions$jump_length <- (starting_window/coverage)/(zoom**(full_positions$iteration - 1))
+    
+    return(full_positions)
+    
+}
+    
 }
 
 ### Functions for producing a training matrix
 
-getWindows <- function(window_run, panel_size, window_size) {
+getWindows <- function(window_run, panel_size, coverage) {
     
     working_panel <- tibble(chromosome = factor(character(), levels = c(1:22, "X", "Y")), position = vector())
     jump_length <- (window_run[2,"position"] - window_run[1, "position"])[1,1]
    
-    coverage <- as.integer(window_size/jump_length)
+    window_size <- coverage*jump_length
     adding <- TRUE
     
     while (adding) {
@@ -250,7 +286,7 @@ getWindows <- function(window_run, panel_size, window_size) {
     return(working_panel)
 }
 
-getMatrix <- function(maf_file, candidate_panel, jump_length, global_tmb_tabe = NULL) {
+getMatrix <- function(maf_file, candidate_panel, jump_length, global_tmb_table = NULL, ...) {
     
     maf_file <- abridge(maf_file, nonsilent = FALSE)
     
@@ -268,11 +304,18 @@ getMatrix <- function(maf_file, candidate_panel, jump_length, global_tmb_tabe = 
             group_by(Tumor_Sample_Barcode) %>% 
             summarise(Window = n())
     
-        colnames(new_column) <- c("Tumor_Sample_Barcode", paste("Window", n))
+        colnames(new_column) <- c("Tumor_Sample_Barcode", paste0("Window_", n))
         window_matrix <- full_join(window_matrix, new_column, by = "Tumor_Sample_Barcode")
         
     }
     
     window_matrix[is.na(window_matrix)]  <- 0
     return(window_matrix)
+}
+
+RLL_windows <- function(new_data, slide_run, starting_window, coverage) {
+    x <- mutate(slide_run, windows = map(data, ~getWindows(.x, starting_window, coverage)))
+    x <- mutate(x, matrices = pmap(x, ~getMatrix(maf_file = new_data, candidate_panel = ..4, jump_length = ..3)))
+
+    return(x)   
 }
