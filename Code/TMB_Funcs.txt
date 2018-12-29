@@ -6,8 +6,16 @@ abridge <- function(maf_file, nonsilent = TRUE) {
 # the TCGA website)
 # Requires tidyverse
     
+    if ("Start_position" %in% colnames(maf_file)) {
+        maf_file <- rename(maf_file, replace = c("Start_position" = "Start_Position"))
+    }
+    
+    if ("End_position" %in% colnames(maf_file)) {
+        maf_file <- rename(maf_file, replace = c("End_position" = "End_Position"))
+    }
+    
     data_abridged <- maf_file %>% 
-       select('Hugo_Symbol', Chromosome, one_of(c('Start_Position','Start_position')), one_of(c('End_Position','End_position')), Strand, Variant_Classification, Variant_Type, Reference_Allele, Tumor_Seq_Allele1, Tumor_Seq_Allele2, Tumor_Sample_Barcode,  Score) %>% 
+       select(Hugo_Symbol, Chromosome, Start_Position, End_Position, Variant_Classification, Variant_Type, Tumor_Sample_Barcode) %>% 
         distinct()
 
     if (nonsilent == TRUE) {
@@ -15,6 +23,73 @@ abridge <- function(maf_file, nonsilent = TRUE) {
             filter(Variant_Classification %in% c('Frame_Shift_Del', 'Frame_Shift_Ins', 'In_Frame_Del', 'In_Frame_Ins', 'Missense_Mutation', 'Nonsense_Mutation', 'Nonstop_Mutation', 'Splice_Site', 'Translation_Start_Site'))
               }
     return(data_abridged)
+}
+
+cbio_getData <- function(path_name, cancer_type = "All", by_cancer = FALSE, test = TRUE, training = 0.7, nonsilent = TRUE) {
+    
+    data <- as_tibble(data.frame(Hugo_Symbol = character(0), Chromosome = character(0), 
+                                 Start_Position = numeric(0), End_Position = numeric(0), 
+                                 Variant_Classification = character(0), Variant_Type = character(0), 
+                                 Tumor_Sample_Barcode = character(0)))
+    
+    for (i in 1:length(dir(path_name))) {
+        
+        if ("data_mutations_extended.txt" %in% dir(paste0(path_name, "/", dir(path_name)[i]))) {
+            study_meta <- read_tsv(paste0(path_name, "/", dir(path_name)[i], "/meta_study.txt"), col_names = FALSE, comment = "#")
+            cancer <- substr(study_meta[1,],17,nchar((study_meta[1,])))
+            
+            if (cancer == cancer_type) {
+                print(dir(path_name)[i])
+                new_data <- read_tsv(paste0(path_name, "/", dir(path_name)[i], "/data_mutations_extended.txt"), comment = "#") 
+                if (all(substr(new_data$Chromosome, 1, 3) == "chr")) {
+                    new_data$Chromosome <- substr(new_data$Chromosome, 4, 6)
+                }
+                new_data <- abridge(new_data, nonsilent)
+                print(new_data %>% 
+                         count(Tumor_Sample_Barcode) %>% 
+                         nrow())
+                data <- bind_rows(data, new_data)  
+            }
+        }
+    }
+    print(data %>% 
+             count(Tumor_Sample_Barcode) %>% 
+             nrow())
+    if (test == TRUE) {
+        tumor_ids <- unique(data$Tumor_Sample_Barcode)
+        
+        training_sample <- sample(length(tumor_ids), floor(training*length(tumor_ids)))
+        test_sample <- setdiff(1:length(tumor_ids), training_sample)
+        print(length(training_sample))
+        print(length(test_sample))
+        training_ids <- tumor_ids[training_sample]
+        test_ids <- tumor_ids[test_sample]
+        
+        training_data <- data %>% 
+            filter(Tumor_Sample_Barcode %in% training_ids)
+        test_data <- data %>% 
+            filter(Tumor_Sample_Barcode %in% test_ids)
+        
+        return(list(training_ids, test_ids, training_data, test_data))
+    }
+    else {
+        return(data)
+    }
+}
+
+cbio_getCancerTypes <- function(path_name) {
+    cancer_types <- c()
+    for (i in 1:length(dir(path_name))) {
+        if (!("data_mutations_extended.txt" %in% dir(paste0(path_name, "/", dir(path_name)[i])))) {
+            print(paste0("Their is no mutations file in ", dir(path_name)[i]))
+        }
+        else {
+            study_meta <- read_tsv(paste0(path_name, "/", dir(path_name)[i], "/meta_study.txt"), col_names = FALSE, comment = "#")
+            cancer <- substr(study_meta[1,],17,nchar((study_meta[1,])))
+            cancer_types <- unique(c(cancer_types, cancer))
+        }
+    }
+    return(cancer_types)
 }
 
 TMB_Calc <- function(maf_file, nonsilent = TRUE) {
