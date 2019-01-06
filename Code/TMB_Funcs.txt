@@ -1,22 +1,29 @@
 ### Functions for Calculating global TMB from whole exome mutation data
 
-abridge <- function(maf_file, nonsilent = TRUE) {
+abridge <- function(maf_file, nonsilent = TRUE, by_study = FALSE) {
 # Takes a maf file and selects the characteristics required to perform TMB analysis
 # and removes duplicate entries (which exist for a variety of reasons, consult
 # the TCGA website)
 # Requires tidyverse
     
     if ("Start_position" %in% colnames(maf_file)) {
-        maf_file <- rename(maf_file, replace = c("Start_position" = "Start_Position"))
+        maf_file <- rename(maf_file, Start_Position = Start_position)
     }
     
     if ("End_position" %in% colnames(maf_file)) {
-        maf_file <- rename(maf_file, replace = c("End_position" = "End_Position"))
+        maf_file <- rename(maf_file, End_Position = End_position)
     }
     
-    data_abridged <- maf_file %>% 
-       select(Hugo_Symbol, Chromosome, Start_Position, End_Position, Variant_Classification, Variant_Type, Tumor_Sample_Barcode) %>% 
-        distinct()
+    if (by_study) {
+        data_abridged <- maf_file %>% 
+            select(Hugo_Symbol, Chromosome, Start_Position, End_Position, Variant_Classification, Variant_Type, Tumor_Sample_Barcode, study) %>% 
+            distinct()
+    }
+    else {
+        data_abridged <- maf_file %>% 
+            select(Hugo_Symbol, Chromosome, Start_Position, End_Position, Variant_Classification, Variant_Type, Tumor_Sample_Barcode) %>% 
+            distinct()   
+    }
 
     if (nonsilent == TRUE) {
         data_abridged <- data_abridged %>% 
@@ -25,12 +32,13 @@ abridge <- function(maf_file, nonsilent = TRUE) {
     return(data_abridged)
 }
 
-cbio_getData <- function(path_name, cancer_type = "All", by_cancer = FALSE, test = TRUE, training = 0.7, nonsilent = TRUE) {
+
+cbio_getData <- function(path_name, cancer_type, by_cancer = FALSE, test = TRUE, training = 0.7, nonsilent = TRUE) {
     
-    data <- as_tibble(data.frame(Hugo_Symbol = character(0), Chromosome = character(0), 
-                                 Start_Position = numeric(0), End_Position = numeric(0), 
-                                 Variant_Classification = character(0), Variant_Type = character(0), 
-                                 Tumor_Sample_Barcode = character(0)))
+    data <- tibble(Hugo_Symbol = character(), Chromosome = character(), 
+                                 Start_Position = vector(), End_Position = vector(), 
+                                 Variant_Classification = character(), Variant_Type = character(), 
+                                 Tumor_Sample_Barcode = character(), study = character())
     
     for (i in 1:length(dir(path_name))) {
         
@@ -44,11 +52,18 @@ cbio_getData <- function(path_name, cancer_type = "All", by_cancer = FALSE, test
                 if (all(substr(new_data$Chromosome, 1, 3) == "chr")) {
                     new_data$Chromosome <- substr(new_data$Chromosome, 4, 6)
                 }
-                new_data <- abridge(new_data, nonsilent)
-                print(new_data %>% 
-                         count(Tumor_Sample_Barcode) %>% 
-                         nrow())
-                data <- bind_rows(data, new_data)  
+                if (all(!is.na(new_data$Chromosome))) {
+                    new_data <- abridge(new_data, nonsilent)
+                    print(new_data %>% 
+                             count(Tumor_Sample_Barcode) %>% 
+                             nrow())
+                    new_data$Tumor_Sample_Barcode <- as.character(new_data$Tumor_Sample_Barcode) 
+                    new_data$Chromosome <- as.character(new_data$Chromosome)
+                    if (nrow(new_data) > 0) {
+                        new_data$study <- dir(path_name)[i]
+                    }
+                    data <- bind_rows(data, new_data)  
+                }
             }
         }
     }
@@ -92,15 +107,41 @@ cbio_getCancerTypes <- function(path_name) {
     return(cancer_types)
 }
 
+cbio_getDataSets <- function(path_name, cancer_type) {
+    data_sets <- c()
+    
+    for (i in 1:length(dir(path_name))) {
+        if (!("data_mutations_extended.txt" %in% dir(paste0(path_name, "/", dir(path_name)[i])))) {
+        print(paste0("Their is no mutations file in ", dir(path_name)[i]))
+        }
+        else {
+            study_meta <- read_tsv(paste0(path_name, "/", dir(path_name)[i], "/meta_study.txt"), col_names = FALSE, comment = "#")
+            cancer <- substr(study_meta[1,],17,nchar((study_meta[1,])))
+            if (cancer == cancer_type) {
+                data_sets <- c(data_sets, dir(path_name)[i])
+            }
+        }
+    }
+    return(data_sets)
+}
+
 TMB_Calc <- function(maf_file, nonsilent = TRUE) {
 # Takes a maf file and outputs a table with tumor sample barcode and TMB value
 # Requires tidyverse to be installed
 # Depends on previous function 'abridge()'
     
-    tmb_table <-  maf_file %>%  
-                abridge(nonsilent = nonsilent) %>% 
-                group_by(Tumor_Sample_Barcode) %>% 
+    if ("study" %in% colnames(maf_file)) {
+        tmb_table <-  maf_file %>%  
+                abridge(nonsilent = nonsilent, by_study = TRUE) %>% 
+                group_by(Tumor_Sample_Barcode, study) %>% 
                 summarise(TMB = n()/30)
+        }
+    else {
+        tmb_table <-  maf_file %>%  
+                abridge(nonsilent = nonsilent) %>% 
+                group_by(Tumor_Sample_Barcode, study) %>% 
+                summarise(TMB = n()/30)     
+    }
     
     return(tmb_table)
 }
