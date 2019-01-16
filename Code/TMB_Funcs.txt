@@ -85,7 +85,9 @@ cbio_getData <- function(path_name, cancer_type, by_cancer = FALSE, test = TRUE,
         test_data <- data %>% 
             filter(Tumor_Sample_Barcode %in% test_ids)
         
-        return(list(training_ids, test_ids, training_data, test_data))
+        out <- list(training_ids, test_ids, training_data, test_data)
+        names(out) <- c("training_ids", "test_ids", "training_data", "test_data")
+        return(out)
     }
     else {
         return(data)
@@ -139,7 +141,7 @@ TMB_Calc <- function(maf_file, nonsilent = TRUE) {
     else {
         tmb_table <-  maf_file %>%  
                 abridge(nonsilent = nonsilent) %>% 
-                group_by(Tumor_Sample_Barcode, study) %>% 
+                group_by(Tumor_Sample_Barcode) %>% 
                 summarise(TMB = n()/30)     
     }
     
@@ -173,7 +175,7 @@ Local_TMB_Calc <- function(maf_file, Chrom, Start, Window_Size, ns = FALSE, pre_
     return(local_tmb_table)
 }
 
-getSignificance <- function(local_tmb_table, global_tmb_table) {
+getPs <- function(local_tmb_table, global_tmb_table) {
 # Takes a local tmb table and a global tmb table and returns the significance of their correlation
 # Not currently set up to account for multiple testing
 # Requires tidyverse
@@ -183,56 +185,15 @@ getSignificance <- function(local_tmb_table, global_tmb_table) {
     #creates a table with Tumor sample barcode, global burden and local burden
     
     if (sum(comparison_table$Local_TMB != 0) > 0) {
-    return(-log(summary(lm(TMB~Local_TMB, comparison_table))$coefficients[2,4]))
+    return(summary(lm(TMB~Local_TMB, comparison_table))$coefficients[2,4])
         }
     else {
-        return(0)
+        return(1)
     }
 }
-    
 
 ### Functions for a first pass window algorithm
-"
-chromosome_slide <- function(maf_file, global_tmb_table = NULL, Chromosome, window_size, jump_length, ns = FALSE) {
-# performs a sliding window algorithm on one chromosome
-# outputs a vector of significances
-# can be given a global tmb table, otherwise will calculate itself
-# requires a genome to be loaded under name 'genome', ideally GChr37
-# requires packages tidyverse, BSGenome and functions abridge, TMB_Calc, Local_TMB_Calc and getSignificance 
-    
-# NOTE there's a weird thing going on at the moment where 'global_tmb_table = NULL' must be explicitly fed 
-# to the function, else it doesn't work
-    
-    chromosomes <- c(1:22, 'X', 'Y')
-    maf_file <- abridge(maf_file, nonsilent = ns)
-    
-    
-    if (is.null(global_tmb_table)) {
-        global_tmb_table <- TMB_Calc(maf_file, nonsilent = TRUE)
-    }
-    
-    significance_vector <- c()
-    position_vector <- c()
-    chromosome_length <- length(genome[[which(chromosomes == Chromosome)]])
-    
-    
-    for (position in seq(from = 1, to = chromosome_length - window_size, by = jump_length)) { 
-        
-        local_tmb_table <- Local_TMB_Calc(maf_file, Chrom = Chromosome, Start = position, Window_Size = window_size, pre_abridged = TRUE)
-        significance_vector <- c(significance_vector, getSignificance(local_tmb_table, global_tmb_table))
-        position_vector <- c(position_vector, position)
-        
-    
-    } 
-    
-    len <- length(significance_vector)
-    chromosome_vector <- rep(Chromosome, len)
-    key_vector <- (1:len)/len
-    
-    return(tibble(chromosome = chromosome_vector, position = position_vector, key = key_vector, significance = significance_vector))
-    
-}
-"
+
 
 chromosome_slide <- function(maf_file, global_tmb_table = NULL, Chromosome, window_size, jump_length, ns = FALSE) {
 # performs a sliding window algorithm on one chromosome
@@ -245,8 +206,6 @@ chromosome_slide <- function(maf_file, global_tmb_table = NULL, Chromosome, wind
 # to the function, else it doesn't work
     
     chromosomes <- c(1:22, "X", "Y")
-    maf_file <- abridge(maf_file, nonsilent = ns)
-    
     
     if (is.null(global_tmb_table)) {
         global_tmb_table <- TMB_Calc(maf_file, nonsilent = TRUE)
@@ -257,19 +216,16 @@ chromosome_slide <- function(maf_file, global_tmb_table = NULL, Chromosome, wind
     len <- length(position_vector)
     key_vector <- (1:len)/len
     chromosome_vector <- rep(Chromosome, len)
-    significance_vector <- map_dbl(position_vector, ~Local_TMB_Calc(maf_file, Chrom = Chromosome, Start = .x, Window_Size = window_size, pre_abridged = TRUE) %>% 
-                                                      getSignificance(global_tmb_table))
-    
+    p_vector <- map_dbl(position_vector, ~Local_TMB_Calc(maf_file, Chrom = Chromosome, Start = .x, Window_Size = window_size, pre_abridged = TRUE) %>% 
+                                                      getPs(global_tmb_table))
+    significance_vector <- -log(p.adjust(p_vector, method = "BH"))
     return(tibble(chromosome = chromosome_vector, position = position_vector, key = key_vector, significance = significance_vector))
     
 }
 
-
 genome_slide <- function(maf_file, global_tmb_table = NULL, window_size, jump_length, ns = FALSE) {
-   
-    maf_file <- abridge(maf_file, nonsilent = ns)
     chromosomes <- c(1:22,"X","Y")
-    
+    genome <- BSgenome.Hsapiens.UCSC.hg19
     if (is.null(global_tmb_table)) {
         global_tmb_table = TMB_Calc(maf_file, nonsilent = TRUE)
     }
@@ -278,7 +234,7 @@ genome_slide <- function(maf_file, global_tmb_table = NULL, window_size, jump_le
     
     
     for (n in 1:24) {
-        print(chromosomes[n])
+        message(chromosomes[n])
         genome_association <- bind_rows(genome_association, chromosome_slide(maf_file, global_tmb_table, chromosomes[n], window_size, jump_length))   
     }
     
@@ -286,63 +242,11 @@ genome_slide <- function(maf_file, global_tmb_table = NULL, window_size, jump_le
     
 }
 
-"
-chromosome_restricted_slide <- function(maf_file, previous_run, zoom = 10, global_tmb_table = NULL, Chromosome, ns = FALSE, coverage = 10) {
-
- 
-    chromosomes <- c(1:22, 'X', 'Y')
-maf_file <- abridge(maf_file, nonsilent = ns)
-    
-    old_jump_length <- as.numeric(previous_run[2,'position'] - previous_run[1,'position'])
-    
-    new_jump_length <- max(1,floor(old_jump_length/zoom))
-    new_window_size <- coverage*new_jump_length
-    
-    quant <- 1 - 1/zoom
-    
-    significant_positions <- previous_run %>% 
-        filter(significance > quantile(significance, quant)) %>% 
-        filter(chromosome == Chromosome)  
-        
-    
-    chromosome_positions <- c()
-    for (position in significant_positions$position) {
-        chromosome_positions <- c(chromosome_positions, seq(from = position, to = position + old_jump_length - new_jump_length, by = new_jump_length))
-    }
-    
-    if (is.null(global_tmb_table)) {
-        global_tmb_table <- TMB_Calc(maf_file, nonsilent = TRUE)
-    }
-    
-    significance_vector <- c()
-    position_vector <- c()
-    chromosome_length <- length(genome[[which(chromosomes == Chromosome)]])
-    
-    
-    for (position in chromosome_positions) { 
-        local_tmb_table <- Local_TMB_Calc(maf_file, Chrom = Chromosome, Start = position, Window_Size = new_window_size, pre_abridged = TRUE)
-        significance_vector <- c(significance_vector, getSignificance(local_tmb_table, global_tmb_table))
-    } 
-    
-    len <- length(significance_vector)
-    chromosome_vector <- rep(Chromosome, len)
-    key_vector <- (1:len)/len
-    
-    if (len > 0) {
-        return(tibble(chromosome = chromosome_vector, position = chromosome_positions, key = key_vector, significance = significance_vector))
-    }
-    else {
-        return(tibble(chromosome = character(), position = vector(), key = vector(), significance = vector()))
-    } 
-    
-}
-"
 
 chromosome_restricted_slide <- function(maf_file, previous_run, zoom = 10, global_tmb_table = NULL, Chromosome, ns = FALSE, coverage = 10) {
 
  
     chromosomes <- c(1:22, "X", "Y")
-maf_file <- abridge(maf_file, nonsilent = ns)
     
     old_jump_length <- as.numeric(previous_run[2,"position"] - previous_run[1,"position"])
     
@@ -368,9 +272,10 @@ maf_file <- abridge(maf_file, nonsilent = ns)
     len <- length(chromosome_positions)
     chromosome_vector <- rep(Chromosome, len)
     key_vector <- (1:len)/len
-    significance_vector <- map_dbl(chromosome_positions, ~Local_TMB_Calc(maf_file, Chrom = Chromosome, Start = .x, Window_Size = new_window_size, pre_abridged = TRUE) %>% 
-                                                              getSignificance(global_tmb_table))
-      
+    p_vector <- map_dbl(chromosome_positions, ~Local_TMB_Calc(maf_file, Chrom = Chromosome, Start = .x, Window_Size = new_window_size, pre_abridged = TRUE) %>% 
+                                                              getPs(global_tmb_table))
+    
+    significance_vector <- -log(p.adjust(p_vector, method = "BH"))
     if (len > 0) {
         return(tibble(chromosome = chromosome_vector, position = chromosome_positions, key = key_vector, significance = significance_vector))
     }
@@ -383,7 +288,6 @@ maf_file <- abridge(maf_file, nonsilent = ns)
 
 genome_restricted_slide <- function(maf_file, previous_run, zoom = 10, global_tmb_table = NULL, ns = FALSE, coverage = 10) {
    
-    maf_file <- abridge(maf_file, nonsilent = ns)
     chromosomes <- c(1:22,"X","Y")
     
     if (is.null(global_tmb_table)) {
@@ -394,8 +298,8 @@ genome_restricted_slide <- function(maf_file, previous_run, zoom = 10, global_tm
     
     
     for (n in 1:24) {
-        print(chromosomes[n])
-        genome_association <- bind_rows(genome_association, chromosome_restricted_slide(maf_file, previous_run, zoom = 10, global_tmb_table = NULL, Chromosome = chromosomes[n], ns = FALSE, coverage = 10))   
+        message(chromosomes[n])
+        genome_association <- bind_rows(genome_association, chromosome_restricted_slide(maf_file, previous_run, zoom, global_tmb_table, Chromosome = chromosomes[n], ns, coverage))   
        
     }
     
@@ -411,7 +315,7 @@ RLL_slide <- function(maf_file, starting_window, iterations, zoom, coverage) {
     
     window_size <- starting_window
     jump_length <- as.integer(window_size/coverage)
-    
+    message("Iteration 1")
     full_positions <- genome_slide(maf_file, global_tmb_table, window_size, jump_length)
     
     full_positions$iteration <- rep(1, nrow(full_positions))
@@ -420,8 +324,8 @@ RLL_slide <- function(maf_file, starting_window, iterations, zoom, coverage) {
     for (index in 2:iterations) {
         window_size <- as.integer(window_size/zoom)
         jump_length <- as.integer(jump_length/zoom)
-        
-        new_positions <- genome_restricted_slide(maf_file, old_positions, zoom, global_tmb_table, coverage)
+        message(paste("Iteration", index))
+        new_positions <- genome_restricted_slide(maf_file, old_positions, zoom, global_tmb_table, coverage = coverage)
         new_positions$iteration <- rep(index, nrow(new_positions))
         
         full_positions <- bind_rows(full_positions, new_positions)
@@ -441,9 +345,10 @@ RLL_slide <- function(maf_file, starting_window, iterations, zoom, coverage) {
 
 ### Functions for producing a training matrix
 
-getWindows <- function(window_run, panel_size, coverage) {
+getWindows <- function(window_run, panel_size, max_windows = 50, coverage = 1) {
     
-    working_panel <- tibble(chromosome = factor(character(), levels = c(1:22, "X", "Y")), position = vector())
+    chromosomes <- c(1:22, "X", "Y")
+    working_panel <- tibble(chromosome = factor(character(), levels = chromosomes), position = vector())
     jump_length <- (window_run[2,"position"] - window_run[1, "position"])[1,1]
    
     window_size <- coverage*jump_length
@@ -476,12 +381,38 @@ getWindows <- function(window_run, panel_size, coverage) {
         }
     }
     
-    return(working_panel)
+    nonadj_working_panel <- working_panel %>% 
+        mutate(seq_id = cumsum(c(1,diff(position)) != jump_length)) %>% 
+        group_by(seq_id) %>% 
+        nest() %>% 
+        mutate(chromosome = map(data, function(data) data$chromosome[1]), 
+               position = map(data, function(data) data$position[1]), 
+               jumps = map(data, function(data) nrow(data))) %>% 
+        select(-c(seq_id, data)) %>% 
+        unnest()
+          
+    n_windows <- nrow(nonadj_working_panel) 
+    nonadj_working_panel$cluster <- 1:n_windows       
+    set.seed(2019)
+                           
+    if (n_windows > max_windows) {
+        nonadj_working_panel$cluster <- (tibble(x = unlist(map(nonadj_working_panel$chromosome, function(x) which(chromosomes == x)))*10**9, y = nonadj_working_panel$position) %>% 
+            kmeans(max_windows))$cluster
+    }
+    
+    return(nonadj_working_panel)
 }
+                                                           
+collapse_col <- function(df, n) {
+  
+    cols <- setdiff(str_subset(colnames(df), paste0("Window_", n)), str_subset(colnames(df), paste0(n, "[1234567890]")))
+    
+    return(df %>% 
+              select(cols) %>% 
+              rowSums()) 
+}                                                           
 
 getMatrix <- function(maf_file, candidate_panel, jump_length, global_tmb_table = NULL, ...) {
-    
-    maf_file <- abridge(maf_file, nonsilent = FALSE)
     
     if (is.null(global_tmb_table)) {
         global_tmb_table = TMB_Calc(maf_file, nonsilent = TRUE)
@@ -490,28 +421,52 @@ getMatrix <- function(maf_file, candidate_panel, jump_length, global_tmb_table =
     window_matrix <- global_tmb_table
     
     for (n in 1:nrow(candidate_panel)) {
-        
         new_column <- maf_file %>% 
-            filter(Chromosome == candidate_panel$chromosome[n], 
-                   Start_Position %in% (candidate_panel$position[n] + 0:(jump_length - 1))) %>%
+            filter(Chromosome == candidate_panel$chromosome[n]) %>% 
+            filter(Start_Position %in% (candidate_panel$position[n] + 0:(jump_length*candidate_panel$jumps[n] - 1))) %>%
             group_by(Tumor_Sample_Barcode) %>% 
             summarise(Window = n())
     
-        colnames(new_column) <- c("Tumor_Sample_Barcode", paste0("Window_", n))
+        colnames(new_column) <- c("Tumor_Sample_Barcode", paste0("Window_", candidate_panel$cluster[n]))
         window_matrix <- full_join(window_matrix, new_column, by = "Tumor_Sample_Barcode")
         
     }
     
     window_matrix[is.na(window_matrix)]  <- 0
-    return(window_matrix)
+    
+    window_matrix <- ungroup(window_matrix)
+    
+    collapsed_window_matrix <- global_tmb_table %>% 
+        ungroup()
+    
+    for (n in 1:length(unique(candidate_panel$cluster))) {
+        new_column <- window_matrix %>% 
+            collapse_col(n)
+        
+        new_col_names <- c(colnames(collapsed_window_matrix), paste0("Window_", n))
+        
+        collapsed_window_matrix <- collapsed_window_matrix %>% 
+            mutate(new = new_column)
+        colnames(collapsed_window_matrix) <- new_col_names        
+    }
+
+    return(collapsed_window_matrix)
 }
 
 
-RLL_windows <- function(new_data, slide_run, starting_window, coverage) {
-    x <- mutate(slide_run, windows = map(data, ~getWindows(.x, starting_window, coverage)))
-    x <- mutate(x, matrices = pmap(x, ~getMatrix(maf_file = new_data, candidate_panel = ..4, jump_length = ..3)))
-
+RLL_windows <- function(slide_run, starting_window, max_windows = 50, coverage = 1) {
+    x <- mutate(slide_run, windows = map(data, ~getWindows(.x, starting_window, max_windows, coverage)))
     return(x)   
+}
+
+RLL_matrices <- function(maf_file, rll_windows, starting_window, max_windows = 50, coverage = 1) {
+    if (!("windows" %in% names(rll_windows))) {
+        rll_windows <- RLL_windows(rll_windows, starting_window, max_windows, coverage)
+    }
+    
+    x <- mutate(rll_windows, matrices = pmap(rll_windows, ~getMatrix(maf_file, candidate_panel = ..4, jump_length = ..3)))
+    
+    return(x)
 }
 
 ### Functions for making an OLM out of data
@@ -545,8 +500,9 @@ getTestMatrix <- function(test_data, model_windows, jump_length) {
     
     for (n in 1:nrow(model_windows)) {
         new_column <- test_data %>% 
-            filter(Chromosome == model_windows$chromosome[n],
-                   Start_Position %in% (model_windows$position[n] + 0:(jump_length - 1)))  %>% 
+            
+            filter(Chromosome == model_windows$chromosome[n]) %>% 
+            filter(Start_Position %in% (model_windows$position[n] + 0:(jump_length*model_windows$jumps[n] - 1))) %>%
             group_by(Tumor_Sample_Barcode) %>% 
             summarise(Window = n())
         colnames(new_column) <- c("Tumor_Sample_Barcode", paste0("Window_", n))
@@ -554,6 +510,8 @@ getTestMatrix <- function(test_data, model_windows, jump_length) {
     }
     
     window_matrix[is.na(window_matrix)] <- 0
+    window_matrix <- ungroup(window_matrix)
+    
     return(window_matrix)
     
 }
@@ -564,6 +522,10 @@ testModel <- function(model, window_matrix, type = "R", threshold = 20) {
     
     if (type == "R") {
         return(broom::glance(lm(actual~prediction, comparison))$r.squared)
+    }
+    
+    if (type == "D") {
+        return(broom::glance(lm(actual~prediction, comparison))$deviance/nrow(comparison))
     }
     
     if (type == "C") {
@@ -580,9 +542,57 @@ testModel <- function(model, window_matrix, type = "R", threshold = 20) {
         correct_low <- low %>% 
                             filter(predicted_tmb_high == FALSE)
         
-        return(tibble(sensitivity = c(nrow(correct_high)/nrow(high)),
-                      specificity = c(nrow(correct_low)/nrow(low))))
+        out <- list(nrow(correct_high)/nrow(high), nrow(correct_low)/nrow(low))
+        names(out) <- c("sensitivity", "specificity")
+        
+        return(out)
     }
+    
+    if (type == "Cmin") {
+        comparison <- comparison %>% 
+            mutate(predicted_tmb_high = prediction >= threshold,
+                   actual_tmb_high = actual >= threshold)
+        
+        high <- comparison %>% 
+                    filter(actual_tmb_high == TRUE)
+        low <- comparison %>% 
+                    filter(actual_tmb_high == FALSE)
+        correct_high <- high %>% 
+                            filter(predicted_tmb_high == TRUE)
+        correct_low <- low %>% 
+                            filter(predicted_tmb_high == FALSE)
+        
+        out <- min(nrow(correct_high)/nrow(high), nrow(correct_low)/nrow(low))
+        
+        
+        return(out)
+    }
+    
+    if (type == "W") {
+        return(comparison)
+    }
+}
+                           
+RLL_test_matrices <- function(test_data, rll_models, type = "R", threshold = 20) {
+    if (!("models" %in% colnames(rll_models))) {
+        rll_models <- RLL_models(rll_models)
+    }
+    
+    rll_test_matrices <- rll_models %>% 
+        mutate(test_matrices = map2(windows, jump_length, ~ getMatrix(test_data, .x, .y)))
+    
+    return(rll_test_matrices)
+}
+                           
+RLL_test <- function(rll_test_matrices, type = "D", threshold = 20) {
+    rll_test <- rll_test_matrices %>% 
+        mutate(training_stats = as.numeric(map2(rll_lung_test_matrices$models, 
+                                     rll_test_matrices$matrices, 
+                                     ~testModel(.x, .y, type, threshold)))) %>% 
+        mutate(test_stats = as.numeric(map2(rll_lung_test_matrices$models, 
+                                     rll_test_matrices$test_matrices, 
+                                     ~testModel(.x, .y, type, threshold))))
+    return(rll_test)
 }
 
 
