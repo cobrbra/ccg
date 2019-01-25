@@ -46,7 +46,7 @@ cbio_getData <- function(path_name, cancer_type, by_cancer = FALSE, test = TRUE,
             study_meta <- read_tsv(paste0(path_name, "/", dir(path_name)[i], "/meta_study.txt"), col_names = FALSE, comment = "#")
             cancer <- substr(study_meta[1,],17,nchar((study_meta[1,])))
             
-            if (cancer == cancer_type) {
+            if (cancer %in% cancer_type) {
                 print(dir(path_name)[i])
                 new_data <- read_tsv(paste0(path_name, "/", dir(path_name)[i], "/data_mutations_extended.txt"), comment = "#") 
                 if (all(substr(new_data$Chromosome, 1, 3) == "chr")) {
@@ -59,10 +59,14 @@ cbio_getData <- function(path_name, cancer_type, by_cancer = FALSE, test = TRUE,
                              nrow())
                     new_data$Tumor_Sample_Barcode <- as.character(new_data$Tumor_Sample_Barcode) 
                     new_data$Chromosome <- as.character(new_data$Chromosome)
+
                     if (nrow(new_data) > 0) {
                         new_data$study <- dir(path_name)[i]
+                        if (by_cancer) {
+                            new_data$cancer_type <- cancer
+                        }
                     }
-                    data <- bind_rows(data, new_data)  
+                    data <- bind_rows(data, new_data) 
                 }
             }
         }
@@ -286,7 +290,7 @@ chromosome_restricted_slide <- function(maf_file, previous_run, zoom = 10, globa
 }
 
 
-genome_restricted_slide <- function(maf_file, previous_run, zoom = 10, global_tmb_table = NULL, ns = FALSE, coverage = 10) {
+genome_restricted_slide <- function(maf_file, previous_run, zoom = 10, global_tmb_table = NULL, ns = FALSE, coverage = 1) {
    
     chromosomes <- c(1:22,"X","Y")
     
@@ -469,7 +473,7 @@ RLL_matrices <- function(maf_file, rll_windows, starting_window, max_windows = 5
     return(x)
 }
 
-### Functions for making an OLM out of data
+### Functions for making an OLM or random forest out of data
 
 getModel <- function(matrix) {
     
@@ -486,36 +490,30 @@ getModel <- function(matrix) {
     return(fit)  
 }
 
-
+get_fModel <- function(matrix) {
+    
+    formula <- matrix %>% 
+        select(starts_with("Window")) %>% 
+        select(which(colSums(.) > 0)) %>% 
+        colnames() %>% 
+        paste(collapse = "+") %>% 
+        paste("TMB ~", .) %>% 
+        as.formula()
+    
+    rf.matrix <- randomForest(formula, matrix, ntree = 200)
+    
+    return(rf.matrix) 
+}
+                                                           
 RLL_models <- function(rll_matrices) {
     return(mutate(rll_matrices, models = map(matrices, getModel)))
 }
-
-### Functions for validating OLM models
-
-getTestMatrix <- function(test_data, model_windows, jump_length) {
-    
-    test_data <- abridge(test_data)   
-    window_matrix <- TMB_Calc(test_data)
-    
-    for (n in 1:nrow(model_windows)) {
-        new_column <- test_data %>% 
-            
-            filter(Chromosome == model_windows$chromosome[n]) %>% 
-            filter(Start_Position %in% (model_windows$position[n] + 0:(jump_length*model_windows$jumps[n] - 1))) %>%
-            group_by(Tumor_Sample_Barcode) %>% 
-            summarise(Window = n())
-        colnames(new_column) <- c("Tumor_Sample_Barcode", paste0("Window_", n))
-        window_matrix <- full_join(window_matrix, new_column, by = "Tumor_Sample_Barcode")  
-    }
-    
-    window_matrix[is.na(window_matrix)] <- 0
-    window_matrix <- ungroup(window_matrix)
-    
-    return(window_matrix)
-    
+                                                           
+RLL_f_models <- function(rll_matrices) {
+    return(mutate(rll_matrices, f_models = map(matrices, get_fModel)))
 }
 
+### Functions for validating models
 
 testModel <- function(model, window_matrix, type = "R", threshold = 20) {
     comparison <- tibble(prediction = predict(model, window_matrix), actual = window_matrix$TMB)
@@ -525,7 +523,10 @@ testModel <- function(model, window_matrix, type = "R", threshold = 20) {
     }
     
     if (type == "D") {
-        return(broom::glance(lm(actual~prediction, comparison))$deviance/nrow(comparison))
+        return(comparison %>% 
+                  mutate(difference2 = (actual - prediction)^2) %>% 
+                  pull(difference2) %>% 
+                  {sum(.)/length(.)})
     }
     
     if (type == "C") {
@@ -584,12 +585,19 @@ RLL_test_matrices <- function(test_data, rll_models, type = "R", threshold = 20)
     return(rll_test_matrices)
 }
                            
-RLL_test <- function(rll_test_matrices, type = "D", threshold = 20) {
+RLL_test <- function(rll_test_matrices, type = "D", threshold = 20, which_model = "OLM") {
+    
+    if (which_model == "OLM") {
+        var_models <- rll_test_matrices$models
+    }
+    if (which_model == "RF") {
+        var_models <- rll_test_matrices$f_models
+    }
     rll_test <- rll_test_matrices %>% 
-        mutate(training_stats = as.numeric(map2(rll_lung_test_matrices$models, 
+        mutate(training_stats = as.numeric(map2(var_models, 
                                      rll_test_matrices$matrices, 
                                      ~testModel(.x, .y, type, threshold)))) %>% 
-        mutate(test_stats = as.numeric(map2(rll_lung_test_matrices$models, 
+        mutate(test_stats = as.numeric(map2(var_models, 
                                      rll_test_matrices$test_matrices, 
                                      ~testModel(.x, .y, type, threshold))))
     return(rll_test)
@@ -597,3 +605,141 @@ RLL_test <- function(rll_test_matrices, type = "D", threshold = 20) {
 
 
 
+### Functions to automate the entire RLL procedure, starting from an RLL slide object, all the way to model testing, and to do this across a range of panel sizes
+                                                           
+                                                           
+RLL_analyse_panel_size <- function(rll_run, data, panel_sizes, max_windows = 50, coverage = 1, type = "D", threshold = 20) {
+    rll_objects <- NA
+    for (size in panel_sizes) {
+        message(paste("panel size", size))
+        message("making windows")
+        rll <- RLL_windows(rll_run, size, max_windows, coverage)
+        message("making matrices")
+        rll <- RLL_matrices(data[["training_data"]], rll, size, coverage = coverage)
+        print(rll$matrices[[2]] %>% 
+                 select(starts_with("Window")))
+        message("making linear models")
+        rll <- RLL_models(rll)
+        message("making random forest models")
+        rll <- RLL_f_models(rll)
+        message("making test matrices")
+        rll <- RLL_test_matrices(data[["test_data"]], rll)
+        rll$size <- size
+        if (is.na(rll_objects)) {
+            rll_objects <- rll %>% 
+                select(-data)
+        }
+        else {
+            rll_objects <- bind_rows(rll_objects, rll %>% select(-data))
+        }
+        
+    }
+    return(rll_objects %>% 
+              group_by(size) %>% 
+              nest())
+}
+                                                           
+                                                           
+RLL_panel_size_test <- function(rll_panel_size_analysis, type = "D", threshold = 20, which_model = "OLM") {
+    
+    stats <- tibble(size = vector(), iteration = vector(), test_train = character(), stat = vector())
+    
+    for (n in 1:length(rll_panel_size_analysis$size)) {
+        new_stats <- RLL_test(rll_panel_size_analysis$data[[n]], type, threshold, which_model) %>% 
+            select(iteration, training_stats, test_stats) %>% 
+            gather(key = test_train, value = stat, -iteration)
+        new_stats$size <- rll_panel_size_analysis$size[[n]]
+        new_stats <- new_stats %>% 
+            select(size, iteration, test_train, stat)
+        stats <- bind_rows(stats, new_stats)
+    }
+    
+    return(stats)
+}
+                                                           
+### ZLL
+                                                          
+ZLL_slide <- function(maf_file, starting_window, iterations, zoom, pan_bias, coverage) {
+# Compiles a dataframe with iterations in one column and the dataframes giving the
+# results of that result of iteration in another. It proceeds like RLL_slide, but 
+# at each iteration insists that the loci 'zoomed' onto are significant across a range
+# of cancer types
+    
+    nested_mafs <- maf_file %>% 
+        group_by(cancer_type) %>% 
+        nest()
+    
+    nested_mafs <- nested_mafs %>% 
+        mutate(tmb_tables = map(data, ~ TMB_Calc(., nonsilent = TRUE)))
+    
+    window_size <- starting_window
+    jump_length <- as.integer(window_size/coverage)
+    n_cancer <- length(nested_mafs$cancer_type)
+    
+    message("Iteration 1")
+    nested_mafs <- nested_mafs %>% 
+        mutate(full_positions = map2(data, tmb_tables, ~genome_slide(.x, .y, window_size, jump_length)))
+    
+    nested_mafs$full_positions <- nested_mafs$full_positions %>% 
+        map(function(x) x %>% mutate(significance = rank(significance)))
+    
+    current_iter <- nested_mafs$full_positions[[1]]
+    current_iter$iteration <- 1
+    
+
+    for (i in 2:n_cancer) {
+        current_iter <- left_join(current_iter, nested_mafs$full_positions[[i]], by = c("chromosome", "position", "key"))
+    }
+     
+    current_iter$significance <- current_iter %>% 
+        select(starts_with("significance")) %>%
+        as.matrix() %>% 
+        rowOrderStats(which = n_cancer + 1 - pan_bias)
+    current_iter <- current_iter %>% 
+        select(iteration, chromosome, position, key, significance)
+      
+    nested_mafs$full_positions <- map(nested_mafs$cancer_type, function(x) current_iter %>% select(- iteration))
+    full_iter <- current_iter
+                                      
+    for (index in 2:iterations) {
+        window_size <- as.integer(window_size/zoom)
+        jump_length <- as.integer(jump_length/zoom)
+        
+        message(paste("Iteration", index))
+        nested_mafs <- nested_mafs %>% 
+            mutate(full_positions = map2(data, full_positions, ~genome_restricted_slide(.x, .y, zoom)))
+
+        nested_mafs$full_positions <- nested_mafs$full_positions %>% 
+            map(function(x) x %>% mutate(significance = rank(significance)))
+                
+        current_iter <- nested_mafs$full_positions[[1]]
+        current_iter$iteration <- index
+        for (i in 2:n_cancer) {
+            current_iter <- left_join(current_iter, nested_mafs$full_positions[[i]], by = c("chromosome", "position", "key"))
+        }
+                
+        current_iter$significance <- current_iter %>% 
+            select(starts_with("significance")) %>%
+            as.matrix() %>% 
+            rowOrderStats(which = n_cancer + 1 - pan_bias)
+                
+        current_iter <- current_iter %>% 
+            select(iteration, chromosome, position, key, significance) 
+                
+        full_iter <- bind_rows(full_iter, current_iter)
+        
+        nested_mafs$full_positions <- map(nested_mafs$cancer_type, function(x) current_iter %>% select(- iteration))
+                   
+    }
+    
+    full_iter <- full_iter %>% 
+        group_by(iteration) %>% 
+        nest()    
+    
+    full_iter$jump_length <- (starting_window/coverage)/(zoom**(full_iter$iteration - 1))
+    
+    return(full_iter)
+    
+}                                                          
+                                                           
+                                                           
