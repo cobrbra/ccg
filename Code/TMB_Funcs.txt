@@ -7,11 +7,13 @@ abridge <- function(maf_file, nonsilent = TRUE, by_study = FALSE) {
 # Requires tidyverse
     
     if ("Start_position" %in% colnames(maf_file)) {
-        maf_file <- rename(maf_file, Start_Position = Start_position)
+        maf_file <- mutate(maf_file, Start_Position = Start_position) %>%
+            select(-Start_position)
     }
     
     if ("End_position" %in% colnames(maf_file)) {
-        maf_file <- rename(maf_file, End_Position = End_position)
+        maf_file <- mutate(maf_file, End_Position = End_position) %>%
+            select(-End_position)
     }
     
     if (by_study) {
@@ -67,6 +69,9 @@ cbio_getData <- function(path_name, cancer_type, by_cancer = FALSE, test = TRUE,
                         }
                     }
                     data <- bind_rows(data, new_data) 
+                   
+                    data$Hugo_Symbol <- make.names(data$Hugo_Symbol)
+                    
                 }
             }
         }
@@ -351,6 +356,7 @@ RLL_slide <- function(maf_file, starting_window, iterations, zoom, coverage) {
 
 getWindows <- function(window_run, panel_size, max_windows = 50, coverage = 1) {
     
+    
     chromosomes <- c(1:22, "X", "Y")
     working_panel <- tibble(chromosome = factor(character(), levels = chromosomes), position = vector())
     jump_length <- (window_run[2,"position"] - window_run[1, "position"])[1,1]
@@ -500,9 +506,25 @@ get_fModel <- function(matrix) {
         paste("TMB ~", .) %>% 
         as.formula()
     
-    rf.matrix <- randomForest(formula, matrix, ntree = 200)
+    rf.matrix <- randomForest(formula, matrix)
     
     return(rf.matrix) 
+}
+                                                           
+get_svmModel <- function(matrix, type = "eps-regression", kernel = "radial") {
+    
+    formula <- matrix %>% 
+        select(starts_with("Window")) %>% 
+        select(which(colSums(.) > 0)) %>% 
+        colnames() %>% 
+        paste(collapse = "+") %>% 
+        paste("TMB ~", .) %>% 
+        as.formula()
+    
+    svm.fit <- svm(formula, matrix)
+    
+    return(svm.fit)
+    
 }
                                                            
 RLL_models <- function(rll_matrices) {
@@ -512,14 +534,30 @@ RLL_models <- function(rll_matrices) {
 RLL_f_models <- function(rll_matrices) {
     return(mutate(rll_matrices, f_models = map(matrices, get_fModel)))
 }
+                                                           
+RLL_svm_models <- function(rll_matrices) {
+    return(mutate(rll_matrices, svm_models = map(matrices, get_svmModel)))
+}                                                           
 
 ### Functions for validating models
 
 testModel <- function(model, window_matrix, type = "R", threshold = 20) {
+    
     comparison <- tibble(prediction = predict(model, window_matrix), actual = window_matrix$TMB)
     
+    
+    if (type == "AUC") {
+        comparison <- mutate(comparison, actual = as.integer(actual >= threshold))
+        
+        return(calc_auc(ggplot(comparison, aes(d = actual, m = prediction)) + geom_roc())$AUC)
+    }
+    
+    if (type == "Cor") {
+        return(cor(comparison$actual, comparison$prediction))
+    }
+    
     if (type == "R") {
-        return(broom::glance(lm(actual~prediction, comparison))$r.squared)
+        return(broom::glance(lm(actual ~ prediction, data = comparison))$r.squared)
     }
     
     if (type == "D") {
@@ -529,7 +567,7 @@ testModel <- function(model, window_matrix, type = "R", threshold = 20) {
                   {sum(.)/length(.)})
     }
     
-    if (type == "C") {
+    if (type == "C" | type == "Cmin" | type == "Con") {
         comparison <- comparison %>% 
             mutate(predicted_tmb_high = prediction >= threshold,
                    actual_tmb_high = actual >= threshold)
@@ -542,6 +580,11 @@ testModel <- function(model, window_matrix, type = "R", threshold = 20) {
                             filter(predicted_tmb_high == TRUE)
         correct_low <- low %>% 
                             filter(predicted_tmb_high == FALSE)
+        
+    }
+    
+    if (type == "C") {
+        
         
         out <- list(nrow(correct_high)/nrow(high), nrow(correct_low)/nrow(low))
         names(out) <- c("sensitivity", "specificity")
@@ -550,23 +593,28 @@ testModel <- function(model, window_matrix, type = "R", threshold = 20) {
     }
     
     if (type == "Cmin") {
-        comparison <- comparison %>% 
-            mutate(predicted_tmb_high = prediction >= threshold,
-                   actual_tmb_high = actual >= threshold)
-        
-        high <- comparison %>% 
-                    filter(actual_tmb_high == TRUE)
-        low <- comparison %>% 
-                    filter(actual_tmb_high == FALSE)
-        correct_high <- high %>% 
-                            filter(predicted_tmb_high == TRUE)
-        correct_low <- low %>% 
-                            filter(predicted_tmb_high == FALSE)
+
         
         out <- min(nrow(correct_high)/nrow(high), nrow(correct_low)/nrow(low))
         
         
         return(out)
+    }
+    
+    if (type == "Con") {
+        
+        false_high <- low %>% 
+            filter(predicted_tmb_high == TRUE)
+        
+        false_low <- high %>% 
+            filter(predicted_tmb_high == FALSE)
+
+        total <- nrow(comparison)
+        out <- tibble(Actual = c("High", "Low"), Predicted_High = c(nrow(correct_high), nrow(false_high))/total,
+                     Predicted_Low = c(nrow(false_low), nrow(correct_low))/total)
+        
+        return(out)
+        
     }
     
     if (type == "W") {
@@ -592,6 +640,9 @@ RLL_test <- function(rll_test_matrices, type = "D", threshold = 20, which_model 
     }
     if (which_model == "RF") {
         var_models <- rll_test_matrices$f_models
+    }
+    if (which_model == "SVM") {
+        var_models <- rll_test_matrices$svm_models
     }
     rll_test <- rll_test_matrices %>% 
         mutate(training_stats = as.numeric(map2(var_models, 
@@ -622,6 +673,8 @@ RLL_analyse_panel_size <- function(rll_run, data, panel_sizes, max_windows = 50,
         rll <- RLL_models(rll)
         message("making random forest models")
         rll <- RLL_f_models(rll)
+        message("making svm models")
+        rll <- RLL_svm_models(rll)
         message("making test matrices")
         rll <- RLL_test_matrices(data[["test_data"]], rll)
         rll$size <- size
@@ -656,7 +709,66 @@ RLL_panel_size_test <- function(rll_panel_size_analysis, type = "D", threshold =
     
     return(stats)
 }
+    
+### Functions for analysing the number of windows restricted to
                                                            
+RLL_analyse_max_windows <- function(rll_run, data, panel_size, max_windows, coverage = 1) {
+    rll_objects <- NA
+    for (max_window in max_windows) {
+        message(paste("max windows:", max_window))
+        rll <- RLL_windows(rll_run, panel_size, max_window, coverage)
+        
+        message("making matrices")
+        rll <- RLL_matrices(data[["training_data"]], rll, panel_size, coverage = coverage)
+        print(rll$matrices[[2]] %>% 
+                 select(starts_with("Window")))
+        
+        message("making linear models")
+        rll <- RLL_models(rll)
+        
+        message("making random forest models")
+        rll <- RLL_f_models(rll)
+        
+        message("making svm models")
+        rll <- RLL_svm_models(rll)
+        
+        message("making test matrices")
+        rll <- RLL_test_matrices(data[["test_data"]], rll)
+        
+        rll$max_window <- max_window
+        
+        if (is.na(rll_objects)) {
+            rll_objects <- rll %>% 
+                select(-data)
+        }
+        else {
+            rll_objects <- bind_rows(rll_objects, rll %>% select(-data))
+        }
+        
+    }
+    
+    return(rll_objects %>% 
+              group_by(max_window) %>% 
+              nest())
+}
+                                                                 
+RLL_max_window_test <- function(rll_max_window_analysis, type = "D", threshold = 20, which_model = "OLM") {
+    
+    stats <- tibble(max_window = vector(), iteration = vector(), test_train = character(), stat = vector())
+    
+    for (n in 1:length(rll_max_window_analysis$max_window)) {
+        new_stats <- RLL_test(rll_max_window_analysis$data[[n]], type, threshold, which_model) %>% 
+            select(iteration, training_stats, test_stats) %>% 
+            gather(key = test_train, value = stat, -iteration)
+        new_stats$max_window <- rll_max_window_analysis$max_window[[n]]
+        new_stats <- new_stats %>% 
+            select(max_window, iteration, test_train, stat)
+        stats <- bind_rows(stats, new_stats)
+    }
+    
+    return(stats)
+}                                                           
+                                          
 ### ZLL
                                                           
 ZLL_slide <- function(maf_file, starting_window, iterations, zoom, pan_bias, coverage) {
@@ -741,5 +853,470 @@ ZLL_slide <- function(maf_file, starting_window, iterations, zoom, pan_bias, cov
     return(full_iter)
     
 }                                                          
-                                                           
-                                                           
+  
+                                          
+### Gene Perspective Functions
+                                          
+gene_TMB_Calc <- function(data, get = "p", report = FALSE) {  
+    
+    if (report) {message("Calculating global tmbs")}
+    tmb_table <- TMB_Calc(data) %>% 
+        select(-study)
+    
+    if (report) {message("Attaching samplewise data")}
+    nested_by_sample <- data %>% 
+        group_by(Tumor_Sample_Barcode) %>% 
+        nest() %>% 
+        ungroup()
+    nested_with_tmb <- full_join(nested_by_sample, tmb_table, by = "Tumor_Sample_Barcode")
+    
+    if (report) {message("Calculating local mutation burdens")}
+    nested_gene_calc <- nested_with_tmb %>% 
+        mutate(gene_mbs = map(data, function (data) count(data, Hugo_Symbol))) %>%
+        select(-data) %>% 
+        unnest()
+    
+    if (report) {message("Compiling gene-wise local vs global tmbs")}
+    by_gene_tmb_vs_lmb <- nested_gene_calc %>% 
+        group_by(Hugo_Symbol) %>% 
+        nest() %>% 
+        mutate(data = map(data, function(data) full_join(tmb_table, data, by = c("Tumor_Sample_Barcode", "TMB")) %>% 
+                                                  mutate(n = replace_na(n, 0))))
+    
+    if ("p" %in% get) {
+        if (report) {message("Computing p_values")}
+        by_gene_tmb_vs_lmb <- by_gene_tmb_vs_lmb %>% 
+            mutate(model = map(data, function(data) summary(lm(TMB ~ n, data = data))$coefficients)) %>% 
+            mutate(coefficient = map(model, function(model) model[2,1])) %>% 
+            mutate(p_val = map(model, function(model) model[2,4])) %>% 
+            select(-model) %>%   
+            mutate(coefficient = unlist(coefficient),
+                   p_val = p.adjust(unlist(p_val), method = "BH")) 
+    }
+                               
+    if ("c" %in% get) {
+        if (report) {message("Computing correlations")} 
+        by_gene_tmb_vs_lmb <- by_gene_tmb_vs_lmb %>% 
+            mutate(cor = map(data, function(data) cor(data$TMB, data$n))) %>% 
+            mutate(cor = unlist(cor))
+      
+    }
+                            
+    return(by_gene_tmb_vs_lmb)
+}
+                             
+get_gene_stats <- function(gene_data) {
+    return(gene_data %>%
+                select(-data) %>% 
+                mutate(coefficient_rank = rank(coefficient)) %>% 
+                mutate(p_val_rank = nrow(gene_data) + 1 - rank(p_val)))
+}
+                           
+by_cancer_gene_stats <- function(maf_file, pan_bias = NULL, pivot = "p_val_rank", report = FALSE) {
+    
+    nested_mafs <- maf_file %>% 
+        group_by(cancer_type) %>% 
+        nest()
+    
+    n_cancer <- length(nested_mafs$cancer_type)
+    
+    if (is.null(pan_bias)) {
+        pan_bias <- n_cancer
+    }
+    
+    nested_mafs <- nested_mafs %>% 
+        mutate(gene_stats = map(data, ~gene_TMB_Calc(.x, report = report) %>% get_gene_stats()))
+    
+    output_stats <- nested_mafs$gene_stats[[1]]
+    
+    for (i in 2:n_cancer) {
+        output_stats <- full_join(output_stats, nested_mafs$gene_stats[[i]], by = c("Hugo_Symbol"))
+    
+    }
+    
+    output_stats[is.na(output_stats)] <- 0
+   
+    output_stats[[pivot]] <- output_stats %>% 
+        select(starts_with(pivot)) %>% 
+        as.matrix() %>%     
+        rowOrderStats(which = n_cancer + 1 - pan_bias)
+    output <- output_stats %>% 
+        select(Hugo_Symbol)
+    
+    output[[pivot]] <- output_stats[[pivot]]
+    output_2 <- nested_mafs %>%
+        select(cancer_type, gene_stats)
+    
+    return(list(output, output_2))
+    
+}
+                           
+get_gene_matrix <- function(data, gene_list, report = FALSE) {
+    
+    tmb_table <- TMB_Calc(data) %>%
+        select(-study)
+    
+    if (length(gene_list) == 0) {
+        return(tmb_table)
+    }
+    
+    data <- data %>% 
+        filter(Hugo_Symbol %in% gene_list)
+    
+    extra_genes <- setdiff(gene_list, what_genes(data))
+    
+    if (report) {message("Attaching samplewise data")}
+    nested_by_sample <- data %>% 
+        group_by(Tumor_Sample_Barcode) %>% 
+        nest() %>% 
+        ungroup()
+  
+    if (report) {message("Calculating local mutation burdens")}
+    nested_gene_calc <- nested_by_sample %>% 
+        mutate(gene_mbs = map(data, function(data) count(data, Hugo_Symbol))) %>%
+        select(-data) %>% 
+        unnest() %>% 
+        spread(key = Hugo_Symbol, value = n)
+                              
+    if (report) {message("Attaching global burdens")}
+    nested_with_tmbs <- full_join(tmb_table, nested_gene_calc, by = "Tumor_Sample_Barcode")  
+    nested_with_tmbs[is.na(nested_with_tmbs)] <- 0
+                              
+    if (report) {message("Attaching missing genes")}
+    for (gene in extra_genes) {
+        nested_with_tmbs[[gene]] <- 0
+    }
+                              
+    return(nested_with_tmbs)
+}
+                              
+what_genes <- function(data) {
+    gene_list <- data %>% 
+        pull(Hugo_Symbol) %>% 
+        unique()
+    
+    return(gene_list)
+}
+                              
+by_cancer_test <- function(model, data, genes, type = "R", threshold = 20) {
+    training_data <- data[["training_data"]] %>% 
+        group_by(cancer_type) %>% 
+        nest()
+    
+    test_data <- data[["test_data"]] %>% 
+        group_by(cancer_type) %>% 
+        nest()
+    
+    training_data <- training_data %>%
+        mutate(data = map(data, ~get_gene_matrix(.x, gene_list = genes))) %>% 
+        mutate(stats = map(data, ~testModel(model, .x, type, threshold))) %>% 
+        select(-data) %>% 
+        mutate(test_train = "training_data")
+    
+    test_data <- test_data %>% 
+        mutate(data = map(data, ~get_gene_matrix(.x, gene_list = genes))) %>%
+        mutate(stats = map(data, ~testModel(model, .x, type, threshold))) %>% 
+        select(-data) %>% 
+        mutate(test_train = "test_data")
+    
+    return(bind_rows(training_data, test_data))    
+    
+} 
+                              
+get_gene_model <- function(model_genes, data, matrix = NULL) {
+    if (is.null(matrix)) {
+        matrix <- get_gene_matrix(data, model_genes) %>%
+            ungroup() %>% 
+            select(-Tumor_Sample_Barcode)
+        }
+        
+    else {
+        matrix <- matrix %>% 
+            ungroup() %>% 
+            select(-Tumor_Sample_Barcode)
+    }
+        
+    fit <- lm(TMB ~ ., data = matrix) 
+    return(fit)
+    
+}
+                              
+get_gene_f_model <- function(model_genes, data, matrix = NULL) {
+    if (is.null(matrix)) {
+        matrix <- get_gene_matrix(data, model_genes) %>%
+            ungroup() %>% 
+            select(-Tumor_Sample_Barcode)
+        }
+    else {
+        matrix <- matrix %>% 
+            ungroup() %>% 
+            select(-Tumor_Sample_Barcode)
+    }
+   
+    fit <- randomForest(TMB ~ ., data = matrix) 
+    return(fit)
+}
+                              
+get_gene_svm_model <- function(model_genes, data, matrix = NULL) {
+    if (is.null(matrix)) {
+        matrix <- get_gene_matrix(data, model_genes) %>%
+            ungroup() %>% 
+            select(-Tumor_Sample_Barcode)
+        }
+    else {
+        matrix <- matrix %>% 
+            ungroup() %>% 
+            select(-Tumor_Sample_Barcode)
+    }
+   
+    fit <- svm(TMB ~ ., data = matrix, kernel = "radial") 
+    return(fit)
+}
+                              
+get_model_stats <- function(model_genes, data) {
+    matrix <- get_gene_matrix(data, model_genes) %>%
+        ungroup() %>% 
+        select(-Tumor_Sample_Barcode)
+   
+    fit <- lm(TMB ~ ., data = matrix) 
+    return(broom::glance(fit)$AIC)
+    
+}
+                              
+iter_models <- function(iters, data, gene_list = NULL) {
+    if (is.null(gene_list)){
+        gene_list <- what_genes(data)
+    } 
+    model_genes <- c()
+    
+    for (iter in 1:iters) {
+        message(iter)
+        new_models <- map(gene_list, ~ get_gene_model(c(model_genes, .x), data))
+        new_gene <- gene_list[which(new_models == min(unlist(new_models)))]
+        
+        model_genes <- c(model_genes, new_gene)
+    }
+
+   return(model_genes)     
+    
+}  
+                              
+analyse_gene_panel_size <- function(sizes, gene_stats, data, test_type, by_cancer = FALSE, threshold = 20) {
+    
+    stats <- tibble(Lin = rep(NA, length(sizes)), RF = rep(NA, length(sizes)), SVM = rep(NA, length(sizes)))
+    
+    if (test_type == "C") {
+        stats <- tibble(Lin = rep(NA, 2*length(sizes)), RF = rep(NA, 2*length(sizes)), SVM = rep(NA, 2*length(sizes)), spec_sens = rep(NA, 2*length(sizes)))
+    }
+    
+    for (i in 1:length(sizes)) {
+        size <- sizes[i]
+        message(paste("Panel size", size))
+        
+        genes <- gene_stats %>% 
+            arrange(desc(p_val_rank)) %>% 
+            pull(Hugo_Symbol) %>% 
+            {.[1:size]}
+        message("making models")
+        message("linear")
+        lin_model <- get_gene_model(genes, data[["training_data"]])
+        message("random forest")    
+        rf_model <- get_gene_f_model(genes, data[["training_data"]])
+        message("svm")
+        svm_model <- get_gene_svm_model(genes, data[["training_data"]])
+        
+        test_matrix <- get_gene_matrix(data[["test_data"]], genes)
+        message("testing models")
+        lin_test <- testModel(lin_model, test_matrix, type = test_type, threshold = threshold)
+        rf_test <- testModel(rf_model, test_matrix, type = test_type, threshold = threshold)
+        svm_test <- testModel(svm_model, test_matrix, type = test_type, threshold = threshold)
+        
+        if (test_type != "C") {
+            stats[i, "Lin"] <- lin_test
+            stats[i,"RF"] <- rf_test
+            stats[i, "SVM"] <- svm_test
+        }
+        if (test_type == "C") {
+            
+            stats[i, "Lin"] <- lin_test$sensitivity; stats[i + length(sizes), "Lin"] <- lin_test$specificity
+            stats[i, "RF"] <- rf_test$sensitivity; stats[i + length(sizes), "RF"] <- rf_test$specificity
+            stats[i, "SVM"] <- svm_test$sensitivity; stats[i + length(sizes), "SVM"] <- svm_test$specificity
+            stats$spec_sens[i] <- "sensitivity"
+            stats$spec_sens[i + length(sizes)] <- "specificity"
+        }
+    }
+    if (test_type == "C") {
+        stats <- stats %>% 
+            gather(model_type, stat, -spec_sens) %>% 
+            mutate(panel_size = rep(sizes, 6))
+    }
+    else {
+        stats <- stats %>% 
+            gather(model_type, stat) %>% 
+            mutate(panel_size = rep(sizes, 3))
+    }
+    return(stats)
+    
+}   
+                              
+method_p <- function(p_val, coefficient, cor, n, length) {
+    return(-log(p_val))
+}
+method_p_over_length <- function(p_val, coefficient, cor, n, length) {
+    return(-log(p_val)/length)
+}
+method_cor <- function(p_val, coefficient, cor, n, length) {
+    return(cor)
+}
+method_cor_over_length <- function(p_val, coefficient, cor, n, length) {
+    return(cor/length)
+}
+method_cor_over_sqrt_length <- function(p_val, coefficient, cor, n, length) {
+    return(cor/sqrt(length))
+}
+method_cor_length_n <-  function(p_val, coefficient, cor, n, length) {
+    return(cor*n/length**1.5)
+}
+                             
+                              
+get_gene_panel_for_size <- function(cancer_stats, method, size) {
+    
+    cancer_stats <- cancer_stats %>% 
+        arrange(desc(method(p_val, coefficient, cor, n, length)))
+    
+    gene_panel <- list()
+    
+    if (cancer_stats$length[1] > size) {
+        message("Size to small for any panel with this method")
+        return(gene_panel)
+    }   
+    
+    else {
+        panel_size <- cancer_stats$length[1]
+        gene_panel <- c(gene_panel, cancer_stats$Hugo_Symbol[1])
+        i <- 2
+        continue  <- TRUE
+    }
+    
+    while (continue) {
+        if (panel_size + cancer_stats$length[i] <= size) {
+            panel_size <- panel_size + cancer_stats$length[i]
+            gene_panel <- c(gene_panel, cancer_stats$Hugo_Symbol[i])
+            i <- i + 1
+        }
+        else {
+            continue = FALSE
+        }
+    }
+    return(gene_panel)
+}                              
+                              
+analyse_gene_panel_lengths <- function(data, lengths, method, cancer_stats, threshold = 20, type = "C") {
+    
+    N <- length(lengths)
+    print(N)
+    
+    if (type == "C") {
+    output <- tibble(lengths = rep(lengths, 6), results = rep(NA, 6*N), 
+                     spec_sens = rep(c("sensitivity", "specificity"), 3, each = N), 
+                     model_type = rep(c("linear", "random_forest", "svm"), each = 2*N))
+    }
+    else {
+        output <- tibble(lengths = rep(lengths, 3), results = rep(NA, 3*N), 
+                        model_type = rep(c("linear", "random_forest", "svm"), each = N))
+    }
+    
+    for (i in 1:N) {
+        message(i)
+        
+        length <- lengths[i]
+        gene_panel <- get_gene_panel_for_size(cancer_stats, method, length)
+
+        lin_mod <- get_gene_model(gene_panel, data[["training_data"]])
+        rf_mod <- get_gene_f_model(gene_panel, data[["training_data"]])
+        svm_mod <- get_gene_svm_model(gene_panel, data[["training_data"]])
+        
+        lin_test <- testModel(lin_mod, get_gene_matrix(data[["test_data"]], gene_panel), threshold = threshold, type = type)
+        rf_test <- testModel(rf_mod, get_gene_matrix(data[["test_data"]], gene_panel), threshold = threshold, type = type)
+        svm_test <- testModel(svm_mod, get_gene_matrix(data[["test_data"]], gene_panel), threshold = threshold, type = type)
+        
+        if (type == "C") {
+        output$results[i] <- lin_test$sensitivity
+        output$results[i + N] <- lin_test$specificity
+        output$results[i + 2*N] <- rf_test$sensitivity
+        output$results[i + 3*N] <- rf_test$specificity
+        output$results[i + 4*N] <- svm_test$sensitivity
+        output$results[i + 5*N] <- svm_test$specificity
+    
+        }
+        else {
+            output$results[i] <- lin_test
+            output$results[i + N]  <- rf_test
+            output$results[i + 2*N] <- svm_test
+        }
+    }
+    
+    return(output)
+}     
+                              
+balance_data <- function(data, threshold = 20) {
+    tmbs <- TMB_Calc(data)
+    
+    high_tmbs <- tmbs %>% 
+        filter(TMB >= threshold)
+    
+    low_tmbs <- tmbs %>% 
+        filter(TMB < threshold)
+    
+    if (nrow(high_tmbs) <= nrow(low_tmbs)) {
+        low_tmbs <- low_tmbs %>% 
+            filter(Tumor_Sample_Barcode %in% sample(low_tmbs$Tumor_Sample_Barcode, nrow(high_tmbs)))
+    }
+    else {
+        high_tmbs <- high_tmbs %>% 
+              filter(Tumor_Sample_Barcode %in% sample(high_tmbs$Tumor_Sample_Barcode, nrow(low_tmbs)))
+    }
+    
+    chosen_ones <- c(low_tmbs$Tumor_Sample_Barcode, high_tmbs$Tumor_Sample_Barcode)
+    
+    balanced_data <- data %>% 
+              filter(Tumor_Sample_Barcode %in% chosen_ones)
+    
+    return(balanced_data)
+}
+                              
+get_roc <- function(models, test_data, genes, threshold = 20) {
+    
+    comparison = tibble(prediction = vector(), actual = vector(), model = character())
+    
+    test_matrix <- get_gene_matrix(test_data, genes) %>%
+            ungroup() %>% 
+            select(-Tumor_Sample_Barcode) %>% 
+            mutate(TMB = as.numeric(TMB >= threshold))
+    
+    for (i in 1:length(models)) {
+        comparison = bind_rows(comparison, tibble(prediction = predict(models[[i]], test_matrix), actual = test_matrix$TMB, model = paste("model",i)))
+    }
+    
+    return(ggplot(comparison, aes(d = actual, m = prediction, colour = model)) + geom_roc())
+}
+                 
+                              
+get_gene_lengths <- function(gene_list, ensembl = ensembl37) {
+    
+    full_lengths <- getBM(c("hgnc_symbol", "chromosome_name", "start_position", "end_position"), filters = "hgnc_symbol", values = gene_list$hgnc_symbol, mart = ensembl) %>% 
+        mutate(length = end_position - start_position) %>% 
+        filter(chromosome_name %in% c(1:22, "X", "Y")) %>% 
+        select(hgnc_symbol, length)
+    
+    coding_lengths <- getBM(c("cds_length", "ensembl_gene_id"), filters = "hgnc_symbol", values = gene_list$hgnc_symbol, mart = ensembl) %>% 
+        {full_join(., getBM(c("hgnc_symbol", "ensembl_gene_id"), filters = "ensembl_gene_id", values = .$ensembl_gene_id, mart = ensembl), by = "ensembl_gene_id")} %>% 
+        group_by(hgnc_symbol) %>% 
+        mutate(max_cds = max(cds_length, na.rm = TRUE)) %>% 
+        select(hgnc_symbol, max_cds) %>% 
+        distinct() %>% 
+        mutate(max_cds = if_else(is.finite(max_cds), max_cds, as.double(NA_integer_)))
+    
+    return(full_join(full_lengths, coding_lengths, by = "hgnc_symbol"))
+        
+}                              
