@@ -1317,6 +1317,59 @@ get_gene_lengths <- function(gene_list, ensembl = ensembl37) {
         distinct() %>% 
         mutate(max_cds = if_else(is.finite(max_cds), max_cds, as.double(NA_integer_)))
     
-    return(full_join(full_lengths, coding_lengths, by = "hgnc_symbol"))
+    genome_lengths <- getBM(c("ensembl_gene_id", "genomic_coding_start", "genomic_coding_end"), filters = "hgnc_symbol", values = gene_list$hgnc_symbol, ensembl37) %>%
+        {full_join(., getBM(c("hgnc_symbol", "chromosome_name", "ensembl_gene_id"), filters = "ensembl_gene_id", values = .$ensembl_gene_id, mart = ensembl), by = "ensembl_gene_id")} %>%
+        filter(chromosome_name %in% c(1:22, "X", "Y")) %>% 
+        select(hgnc_symbol,genomic_coding_start, genomic_coding_end) %>% 
+        filter(!(is.na(genomic_coding_start)|is.na(genomic_coding_end))) %>% 
+        group_by(hgnc_symbol) %>% 
+        nest() %>% 
+        mutate(data = map(data, function(data) data %>% 
+                  pmap(function(genomic_coding_start, genomic_coding_end) genomic_coding_start:genomic_coding_end) %>% 
+                  unlist() %>% 
+                  unique() %>% 
+                  length())) %>% 
+        mutate(genome_length = unlist(data)) %>% 
+        select(hgnc_symbol, genome_length)
+    
+    
+    return(full_join(full_lengths, coding_lengths, by = "hgnc_symbol") %>% 
+              full_join(genome_lengths, by = "hgnc_symbol"))
         
-}                              
+}
+               
+get_chr_bed <- function(chromosome_positions) {
+    chromosome_positions <- chromosome_positions %>% 
+        mutate(backconsec = position - lag(position)) %>% 
+        mutate(forconsec = lead(position) - position) %>% 
+        mutate(backconsec = is.na(backconsec) | backconsec != 1) %>% 
+        mutate(forconsec = is.na(forconsec) | forconsec != 1)
+    
+    chromStart <- chromosome_positions %>% 
+        filter(backconsec) %>% 
+        pull(position)
+    
+    chromEnd <- chromosome_positions %>% 
+        filter(forconsec) %>% 
+        pull(position)
+    
+    return(tibble(chromStart, chromEnd))
+}
+               
+get_bed <- function(gene_list, ensembl = ensembl37, by = "genome_length") {
+    if (by == "genome_length") {
+        all_loci <- getBM(c("chromosome_name", "genomic_coding_start", "genomic_coding_end"), filters = "hgnc_symbol", values = gene_list, mart = ensembl37) %>% 
+            filter(!(is.na(genomic_coding_start)|is.na(genomic_coding_end))) %>% 
+            pmap(function(chromosome_name, genomic_coding_start, genomic_coding_end) tibble(chrom = rep(paste0("chr", chromosome_name), length(genomic_coding_start:genomic_coding_end)), position = genomic_coding_start:genomic_coding_end)) %>% 
+            bind_rows() %>% 
+            distinct() %>% 
+            filter(chrom %in% paste0("chr", c(1:22, "X", "Y"))) %>% 
+            group_by(chrom) %>% 
+            nest() %>% 
+            arrange(chrom) %>%
+            mutate(data = map(data, ~arrange(.x, position))) %>%
+            mutate(data = map(data, get_chr_bed)) %>% 
+            unnest()
+    }
+    return(all_loci)
+}               
